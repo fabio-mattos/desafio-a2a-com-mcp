@@ -2,7 +2,7 @@
 
 Entrega do desafio "A Ponte" (MBA Engenharia de Software com IA, curso de MCP e A2A). Central de Salas da Hill Valley Tech: um servidor MCP que expõe as salas como capacidade, e um agente que consome esse servidor por dentro (host MCP) e se oferece por fora como servidor A2A (`reservar-sala`).
 
-Stack: Python 3.10+, apenas biblioteca padrão nos dois processos (`http.server`, `urllib`, `hmac`, `json`). Sem ORM, sem banco, sem dependência de SDK de LLM.
+Stack: Python 3.10+. O servidor MCP usa o SDK oficial `mcp` (v2.2.0, revisão de protocolo `2026-07-28`) mais `uvicorn`, com versões travadas em `servidor-mcp/pyproject.toml`. O agente usa só biblioteca padrão (`http.server`, `urllib`, `json`) nos dois papéis (host MCP e servidor A2A) — o porquê está em "Decisões técnicas". Sem ORM, sem banco, sem dependência de SDK de LLM.
 
 ## Como rodar
 
@@ -14,16 +14,20 @@ A partir de um clone limpo, em dois terminais.
 python3 -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-**2. Terminal 1 — servidor MCP** (porta `7301`):
+**2. Terminal 1 — servidor MCP** (porta `7301`). Ele depende do SDK oficial, então crie um venv e instale antes de subir:
 
 ```bash
+cd servidor-mcp
+python3 -m venv .venv
+source .venv/bin/activate        # no Windows: .venv\Scripts\activate
+pip install .
 export REQUEST_STATE_SECRET="<a chave que voce gerou no passo 1>"
-python3 servidor-mcp/server.py
+python3 server.py
 ```
 
-No PowerShell: `$env:REQUEST_STATE_SECRET = "<chave>"` antes do `python servidor-mcp/server.py`.
+No PowerShell: `$env:REQUEST_STATE_SECRET = "<chave>"` antes do `python server.py`.
 
-**3. Terminal 2 — agente** (porta `7300`; precisa do servidor MCP já respondendo):
+**3. Terminal 2 — agente** (porta `7300`; precisa do servidor MCP já respondendo). Não tem dependência externa, roda com o Python do sistema:
 
 ```bash
 python3 agente/server.py
@@ -47,7 +51,9 @@ Variáveis de ambiente opcionais (os padrões já são os exigidos pelo enunciad
 
 ## Onde a ponte acontece
 
-Toda a costura mora em `agente/server.py`, nas duas funções que dão nome à seção "5. A ponte" do enunciado:
+Do lado do servidor, `servidor-mcp/server.py::escolha_de_sala` é o resolver que decide, por regra de negócio, se `reservar_sala` segue direto ou precisa perguntar uma alternativa: sem conflito, devolve a própria sala pedida; com conflito e alternativas, devolve `Elicit(...)`, e o SDK (`MCPServer`/`Resolve`) é quem transforma isso em `resultType: input_required` com `inputRequests`/`requestState`, porque a versão negociada é `>= 2026-07-28`.
+
+Do lado do agente, a costura mora em `agente/server.py`, nas duas funções que dão nome à seção "5. A ponte" do enunciado:
 
 - **`_pausar()`** é onde o `input_required` do MCP se transforma em `TASK_STATE_INPUT_REQUIRED`. Ela lê a chave e o `enum` do `inputRequests` devolvido pelo servidor MCP, monta a linha `alternativas: <ids>` como mensagem da Task, e guarda o `requestState` opaco dentro de uma `Pendencia` associada àquela Task especificamente (nunca num estado global) — é isso que faz duas Tasks pausadas ao mesmo tempo nunca trocarem de `requestState` entre si (critério de aceite da ponte, verificação 33 do validador).
 - **`continuar_escolha()`** é onde a resposta do cliente A2A (`escolha=<valor>`) volta a ser um `tools/call` novo contra o servidor MCP: o `requestState` guardado é ecoado sem modificação, o `inputResponses` leva a mesma chave que veio no `inputRequests`, e o id de JSON-RPC é gerado de novo a cada chamada dentro de `cliente_mcp._chamar()` — nunca reaproveitado do request original.
@@ -56,9 +62,9 @@ O `traceparent` entra em `_send_message()` (mesmo arquivo): quando o cliente A2A
 
 ## Decisões técnicas
 
-- **Sem SDK oficial de MCP/A2A instalado.** As versões descritas no enunciado (revisão MCP `2026-07-28`, MRTR/`input_required`, os códigos `-32020`/`-32021`, o espelhamento de `Mcp-Method`/`Mcp-Name`) são um recorte específico do curso que não corresponde a um pacote publicado que eu conseguisse instalar. Para não arriscar reescrever o protocolo por baixo de uma abstração que não fala exatamente essa revisão, implementei o transporte Streamable HTTP e o binding JSON-RPC do A2A diretamente contra os contratos de `exemplos/wire/` e `validador/validar.py`, usando só a biblioteca padrão do Python nos dois processos. Cada regra do enunciado (MRTR, elicitation em form mode, capability negotiation por request, máquina de estados da Task) tem uma linha de código correspondente, não uma simulação por fora do SDK.
-- **`requestState`**: JSON assinado com HMAC-SHA256 (`servidor-mcp/estado_requisicao.py`). O payload leva o pedido original inteiro (sala, início, fim, responsável, a chave da elicitation e as alternativas seladas) mais um `exp` de 15 minutos, dentro da janela de 5–30 minutos exigida. A chave vem só de `REQUEST_STATE_SECRET`; o servidor recusa subir sem ela. Verificação é `hmac.compare_digest` sobre os bytes exatos do payload — qualquer byte trocado no token invalida a assinatura e o retry cai em `-32602`. Como a integridade e a expiração vivem inteiramente dentro do token, e a chave vem de variável de ambiente, um restart do processo entre o `input_required` e o retry não invalida um token legítimo (testado manualmente: gerar o conflito, matar o processo, subir de novo com a mesma `REQUEST_STATE_SECRET`, e o retry ainda conclui a reserva).
-- **Os argumentos do retry não são confiáveis**: no caminho de retry (`servidor-mcp/server.py::_reservar_retry`), o servidor ignora por completo o campo `arguments` que o cliente reenvia e reconstrói o pedido só a partir do que foi selado no `requestState`.
+- **Servidor MCP sobre o SDK oficial de verdade.** `servidor-mcp/server.py` usa `mcp.server.mcpserver.MCPServer` (pacote `mcp` v2.2.0, a v2 alinhada à revisão `2026-07-28`). O transporte Streamable HTTP, a validação dos campos obrigatórios de `_meta`, o espelhamento dos headers `Mcp-Method`/`Mcp-Name` (com `-32020` na divergência) e o ciclo inteiro de MRTR (`InputRequiredResult`, a checagem de capability com `-32021` e a mensagem exata "Client did not declare the form elicitation capability required by resolver '...'") são resolvidos pelo próprio framework, não reescritos na mão. A única peça de negócio é o resolver `escolha_de_sala` (`Annotated[ElicitationResult[Any], Resolve(escolha_de_sala)]`), descrito acima em "Onde a ponte acontece". Isso só foi possível depois de instalar o SDK e ler o código-fonte para confirmar, com evidência, que a revisão `2026-07-28` do enunciado é exatamente a que essa versão implementa (não é uma invenção do curso).
+- **`requestState`**: selado pelo próprio SDK, via `mcp.server.request_state.RequestStateSecurity(keys=[REQUEST_STATE_SECRET], ttl=900)`. O codec padrão é AES-256-GCM com a chave derivada por HKDF-SHA256 — então o `requestState` é cifrado, não só assinado, e qualquer adulteração quebra a tag de autenticação. O TTL configurado é de 15 minutos, dentro da janela de 5–30 exigida. O framework também amarra o token aos argumentos exatos da chamada (`tools/call`, nome da tool, hash dos `arguments`): se o cliente reenviar `arguments` diferentes no retry, o token é rejeitado por inteiro com `-32602` em vez de silenciosamente ignorar a divergência — um dos dois caminhos que o enunciado aceita para "argumentos adulterados não tomam efeito". A chave vem só de `REQUEST_STATE_SECRET`; o servidor recusa subir sem ela. Testado manualmente: gerar o conflito, matar o processo do servidor MCP, subir de novo com a mesma `REQUEST_STATE_SECRET`, e o retry ainda conclui a reserva.
+- **Por que o agente não usa `mcp.client.ClientSession` para o lado host.** Tentei: `ClientSession.list_tools()` não aceita um `meta` por chamada (só `call_tool()` aceita), e `ClientSession.initialize()` faz o handshake clássico de sessão — na minha instalação ele negociou para a revisão `2025-11-25`, não a `2026-07-28` sem sessão que o enunciado pede. A API de alto nível do cliente é desenhada em torno de uma versão negociada uma vez no `initialize` e reaproveitada depois, o que contraria "nenhum dos dois lados pode inferir versão... de conexão aberta". Em vez de forçar esse encaixe, `agente/cliente_mcp.py` fala Streamable HTTP direto com `urllib`, declarando `_meta` e os headers em toda chamada — o mesmo formato de wire que o servidor (agora real) produz e consome, verificado byte a byte contra `exemplos/wire/`. A seção "A2A v1.0" do enunciado não nomeia um SDK obrigatório, então o lado A2A do agente (`SendMessage`/`GetTask`/Task) segue com biblioteca padrão sem essa mesma ressalva.
 - **Estado das Tasks**: em memória, dentro de `agente/tarefas.py` (`Tarefas`, um dicionário `id -> Task`). Não sobrevive a um restart do agente, o que é aceitável pelo enunciado (só o `requestState` precisa sobreviver a restart, e esse mora no servidor MCP, opaco para o agente).
 - **Dois processos de fato**: o agente nunca importa uma função do servidor MCP; toda chamada passa por `agente/cliente_mcp.py`, que fala HTTP com `urllib`.
 
@@ -67,7 +73,7 @@ O `traceparent` entra em `_send_message()` (mesmo arquivo): quando o cliente A2A
 Execução com os dois processos recém-iniciados:
 
 ```
-trace-id desta execucao: b2ac87845c389b288ab63d899f9cde3b
+trace-id desta execucao: 632966850842eddd21985c14e7eb4dc1
 procure esse valor no stderr do servidor MCP para conferir a propagacao do traceparent.
 
 PASS 01 tools/list traz as tres tools
