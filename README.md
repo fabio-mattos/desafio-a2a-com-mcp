@@ -73,7 +73,7 @@ O `traceparent` entra em `_send_message()` (mesmo arquivo): quando o cliente A2A
 Execução com os dois processos recém-iniciados:
 
 ```
-trace-id desta execucao: 768786e6ada4e6afcabd3b846afc58c1
+trace-id desta execucao: 2a2bd550bed20b231665139cb15e1141
 procure esse valor no stderr do servidor MCP para conferir a propagacao do traceparent.
 
 PASS 01 tools/list traz as tres tools
